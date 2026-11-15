@@ -1,0 +1,18 @@
+Klipra 0.16.1 Preview — Third-party components
+
+FFmpeg and FFprobe are separate executables invoked by the Klipra media worker.
+Mac builds: FFmpeg 9.0.2, Martin Riedl static GPLv3 builds.
+Provider: https://ffmpeg.martin-riedl.de/
+Build recipe: https://git.martin-riedl.de/ffmpeg/build-script
+FFmpeg source archive: ffmpeg-9.0.2-source.tar.xz attached to this release.
+External component versions and configuration: FFmpeg-macOS-build-details.txt in this archive.
+
+Node.js is included as a separate JavaScript runtime for yt-dlp.
+Source and notices: https://github.com/nodejs/node
+
+Python, PyInstaller, yt-dlp, yt-dlp-ejs, NumPy, OpenCV, sherpa-onnx and their bundled dependencies retain their upstream licenses.
+whisper.cpp and llama.cpp retain their MIT licenses.
+Geist and Instrument Serif fonts retain their SIL Open Font Licenses.
+YuNet face detector: license included in the archive.
+
+Klipra application source and branding are separate from these third-party components.
