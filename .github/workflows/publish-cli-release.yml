@@ -1,7 +1,12 @@
-name: Publish verified Linux CLI
+name: Publish verified Klipra packages
 on:
   workflow_dispatch:
     inputs:
+      kind:
+        description: Package artifact to stage
+        type: choice
+        options: [CLI, LINUX, WINDOWS]
+        default: CLI
       version:
         description: Engine version of the tested CLI packages
         required: true
@@ -11,7 +16,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: publish-linux-cli
+  group: publish-verified-klipra-packages
   cancel-in-progress: false
 jobs:
   publish:
@@ -23,7 +28,8 @@ jobs:
           python-version: '3.12'
       - name: Download and publish verified packages
         env:
-          ARTIFACT_URL: ${{ secrets.KLIPRA_CLI_ARTIFACT_URL }}
+          ARTIFACT_URL: ${{ secrets[format('KLIPRA_{0}_ARTIFACT_URL', inputs.kind)] }}
+          PACKAGE_KIND: ${{ inputs.kind }}
           EXPECTED_DIGEST: ${{ inputs.artifact_digest }}
           ENGINE_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
@@ -32,6 +38,8 @@ jobs:
         run: |
           import hashlib, json, os, pathlib, re, subprocess, zipfile
           version = os.environ['ENGINE_VERSION']
+          kind = os.environ['PACKAGE_KIND']
+          assert kind in ('CLI', 'LINUX', 'WINDOWS')
           digest = os.environ['EXPECTED_DIGEST'].removeprefix('sha256:')
           assert re.fullmatch(r'\d+\.\d+\.\d+', version)
           assert re.fullmatch(r'[a-f0-9]{64}', digest)
@@ -40,22 +48,24 @@ jobs:
           subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location', '--retry', '2', os.environ['ARTIFACT_URL'], '-o', 'artifact.zip'], check=True)
           with open('artifact.zip', 'rb') as file:
               assert hashlib.file_digest(file, 'sha256').hexdigest() == digest
-          names = {f'Klipra_CLI_{version}_linux_x64.' + suffix for suffix in ('deb', 'deb.sha256', 'tar.gz', 'tar.gz.sha256')}
-          names.add('linux-cli-validation.json')
+          binary_names = [f'Klipra_CLI_{version}_linux_x64.{extension}' for extension in ('deb', 'tar.gz')] if kind == 'CLI' else [f'Klipra_{version}_linux_x64.{extension}' for extension in ('deb', 'AppImage')] if kind == 'LINUX' else [f'Klipra_{version}_windows_x64.exe']
+          names = set(binary_names) | {name + '.sha256' for name in binary_names}
+          if kind == 'CLI': names.add('linux-cli-validation.json')
           out = pathlib.Path('packages'); out.mkdir()
           with zipfile.ZipFile('artifact.zip') as archive:
               assert set(archive.namelist()) == names
               assert sum(item.file_size for item in archive.infolist()) < 1_000_000_000
               assert archive.testzip() is None
               archive.extractall(out)
-          for extension in ('deb', 'tar.gz'):
-              path = out / f'Klipra_CLI_{version}_linux_x64.{extension}'
+          for name in binary_names:
+              path = out / name
               with path.open('rb') as file:
                   actual = hashlib.file_digest(file, 'sha256').hexdigest()
               assert path.with_name(path.name + '.sha256').read_text().split()[0] == actual
-          report = json.loads((out / 'linux-cli-validation.json').read_text())
-          assert report['version'] == version and len(report['checks']) >= 12
-          tag = f'v{version}-cli-preview.1'
+          if kind == 'CLI':
+              report = json.loads((out / 'linux-cli-validation.json').read_text())
+              assert report['version'] == version and len(report['checks']) >= 12
+          tag = f'v{version}-cli-preview.1' if kind == 'CLI' else f'v{version}-preview.1'
           notes = pathlib.Path('notes.md')
           notes.write_text(f'''Klipra Linux CLI {version} adds Groq, Replicate, and Cloudflare Workers AI to the same shared media engine used by desktop.
 
@@ -71,14 +81,48 @@ jobs:
 
           [Complete documentation](https://klipra.crafyne.com/cli) · [AI agent reference](https://klipra.crafyne.com/llms-full.txt)
           ''')
-          subprocess.run(['gh', 'release', 'create', tag, '--draft', '--prerelease', '--title', f'Klipra Linux CLI {version} Preview', '--notes-file', str(notes)], check=True)
+          releases = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/releases']))
+          existing = next((item for item in releases if item['tag_name'] == tag), None)
+          if existing:
+              assert existing['draft'], 'Published releases are immutable.'
+          else:
+              subprocess.run(['gh', 'release', 'create', tag, '--draft', '--prerelease', '--title', f'Klipra {"Linux CLI " if kind == "CLI" else ""}{version} Preview', '--notes-file', str(notes)], check=True)
           subprocess.run(['gh', 'release', 'upload', tag, *map(str, sorted(out.iterdir()))], check=True)
-          release = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/releases/tags/{tag}']))
-          assert len(release['assets']) == len(names)
-          for asset in release['assets']:
+          releases = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/releases']))
+          release = next(item for item in releases if item['tag_name'] == tag and item['draft'])
+          assert names <= {asset['name'] for asset in release['assets']}
+          for asset in (item for item in release['assets'] if item['name'] in names):
               path = out / asset['name']
               with path.open('rb') as file:
                   actual = 'sha256:' + hashlib.file_digest(file, 'sha256').hexdigest()
               assert asset['state'] == 'uploaded' and asset['size'] == path.stat().st_size and asset['digest'] == actual
-          subprocess.run(['gh', 'release', 'edit', tag, '--draft=false'], check=True)
-          print('Published verified CLI packages:', tag)
+          if kind == 'CLI':
+              assert len(release['assets']) == len(names)
+              subprocess.run(['gh', 'release', 'edit', tag, '--draft=false'], check=True)
+          print('Verified release packages:', kind, tag)
+      - name: Carry forward unchanged runtime sources and licenses
+        if: inputs.kind == 'LINUX'
+        env:
+          ENGINE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess
+          repo = os.environ['GH_REPO']
+          tag = f'v{os.environ["ENGINE_VERSION"]}-preview.1'
+          legacy = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/releases/tags/v0.16.1-preview.1']))
+          folder = pathlib.Path('runtime-sources'); folder.mkdir()
+          for asset in legacy['assets']:
+              name = asset['name']
+              if not name.lower().startswith(('ffmpeg', 'ffprobe', 'node-', 'python-', 'media-source-revisions')):
+                  continue
+              assert pathlib.Path(name).name == name and asset['size'] < 25_000_000
+              path = folder / name
+              subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location', asset['browser_download_url'], '-o', str(path)], check=True)
+              with path.open('rb') as file:
+                  digest = hashlib.file_digest(file, 'sha256').hexdigest()
+              assert asset['digest'] == 'sha256:' + digest
+              path.with_name(name + '.sha256').write_text(f'{digest}  {name}\n')
+          subprocess.run(['gh', 'release', 'upload', tag, *map(str, sorted(folder.iterdir()))], check=True)
+          print('Staged matching runtime sources and license files.')
