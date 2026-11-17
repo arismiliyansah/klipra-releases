@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Download and publish verified packages
         env:
           ARTIFACT_URL: ${{ secrets.KLIPRA_CLI_ARTIFACT_URL }}
