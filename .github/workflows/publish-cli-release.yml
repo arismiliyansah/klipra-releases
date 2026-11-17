@@ -1,0 +1,81 @@
+name: Publish verified Linux CLI
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Engine version of the tested CLI packages
+        required: true
+      artifact_digest:
+        description: SHA-256 of the tested Actions artifact ZIP
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: publish-linux-cli
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Download and publish verified packages
+        env:
+          ARTIFACT_URL: ${{ secrets.KLIPRA_CLI_ARTIFACT_URL }}
+          EXPECTED_DIGEST: ${{ inputs.artifact_digest }}
+          ENGINE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess, zipfile
+          version = os.environ['ENGINE_VERSION']
+          digest = os.environ['EXPECTED_DIGEST'].removeprefix('sha256:')
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+          assert re.fullmatch(r'[a-f0-9]{64}', digest)
+          # The short-lived URL grants read access only to the installer ZIP.
+          # It is stored as a masked secret and removed after this workflow.
+          subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location', '--retry', '2', os.environ['ARTIFACT_URL'], '-o', 'artifact.zip'], check=True)
+          with open('artifact.zip', 'rb') as file:
+              assert hashlib.file_digest(file, 'sha256').hexdigest() == digest
+          names = {f'Klipra_CLI_{version}_linux_x64.' + suffix for suffix in ('deb', 'deb.sha256', 'tar.gz', 'tar.gz.sha256')}
+          names.add('linux-cli-validation.json')
+          out = pathlib.Path('packages'); out.mkdir()
+          with zipfile.ZipFile('artifact.zip') as archive:
+              assert set(archive.namelist()) == names
+              assert sum(item.file_size for item in archive.infolist()) < 1_000_000_000
+              assert archive.testzip() is None
+              archive.extractall(out)
+          for extension in ('deb', 'tar.gz'):
+              path = out / f'Klipra_CLI_{version}_linux_x64.{extension}'
+              with path.open('rb') as file:
+                  actual = hashlib.file_digest(file, 'sha256').hexdigest()
+              assert path.with_name(path.name + '.sha256').read_text().split()[0] == actual
+          report = json.loads((out / 'linux-cli-validation.json').read_text())
+          assert report['version'] == version and len(report['checks']) >= 12
+          tag = f'v{version}-cli-preview.1'
+          notes = pathlib.Path('notes.md')
+          notes.write_text(f'''Klipra Linux CLI {version} adds Groq, Replicate, and Cloudflare Workers AI to the same shared media engine used by desktop.
+
+          - Groq: model discovery, chat, and timed Whisper transcription.
+          - Replicate: native schema-based predictions for compatible text/vision, speech, and image models, with polling and cancellation.
+          - Workers AI: Account ID setup, account model discovery, compatible chat, native timed speech, and image covers.
+
+          All 46 desktop-engine operations remain available. Both the standalone archive and DEB are tested on minimal Ubuntu 22.04 x86_64 without a GUI or system Python. CPU runtimes are bundled; model weights are separate. See the attached package acceptance report and SHA-256 files.
+
+          Archive: extract and run `./klipra-cli-linux-x86_64/install.sh --prefix "$HOME/.local"`.
+          Debian/Ubuntu: `sudo apt install ./Klipra_CLI_{version}_linux_x64.deb`.
+          Stop the old CLI service before updating: `klipra-cli service stop`.
+
+          [Complete documentation](https://klipra.crafyne.com/cli) · [AI agent reference](https://klipra.crafyne.com/llms-full.txt)
+          ''')
+          subprocess.run(['gh', 'release', 'create', tag, '--draft', '--prerelease', '--title', f'Klipra Linux CLI {version} Preview', '--notes-file', str(notes)], check=True)
+          subprocess.run(['gh', 'release', 'upload', tag, *map(str, sorted(out.iterdir()))], check=True)
+          release = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/releases/tags/{tag}']))
+          assert len(release['assets']) == len(names)
+          for asset in release['assets']:
+              path = out / asset['name']
+              with path.open('rb') as file:
+                  actual = 'sha256:' + hashlib.file_digest(file, 'sha256').hexdigest()
+              assert asset['state'] == 'uploaded' and asset['size'] == path.stat().st_size and asset['digest'] == actual
+          subprocess.run(['gh', 'release', 'edit', tag, '--draft=false'], check=True)
+          print('Published verified CLI packages:', tag)
